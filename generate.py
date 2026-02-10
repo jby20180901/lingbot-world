@@ -190,6 +190,27 @@ def _parse_args():
         action="store_true",
         default=False,
         help="Whether to convert model paramerters dtype.")
+    parser.add_argument(
+        "--use_sliding_window",
+        action="store_true",
+        default=False,
+        help="Whether to use sliding window mechanism for long video generation. This allows generation of long videos with bounded memory usage.")
+    parser.add_argument(
+        "--window_size",
+        type=int,
+        default=49,
+        help="Size of sliding window in frames (must be 4n+1). Default: 49")
+    parser.add_argument(
+        "--overlap_size",
+        type=int,
+        default=None,
+        help="Size of overlap between windows in frames. Default: window_size // 2")
+    parser.add_argument(
+        "--blend_mode",
+        type=str,
+        default="lerp",
+        choices=["lerp", "crossfade"],
+        help="Blending mode for overlapping regions: 'lerp' (linear interpolation) or 'crossfade' (smooth crossfade). Default: lerp")
     
     args = parser.parse_args()
     _validate_args(args)
@@ -283,18 +304,52 @@ def generate(args):
         convert_model_dtype=args.convert_model_dtype,
     )
     logging.info("Generating video ...")
-    video = wan_i2v.generate(
-        args.prompt,
-        img,
-        action_path=args.action_path,
-        max_area=MAX_AREA_CONFIGS[args.size],
-        frame_num=args.frame_num,
-        shift=args.sample_shift,
-        sample_solver=args.sample_solver,
-        sampling_steps=args.sample_steps,
-        guide_scale=args.sample_guide_scale,
-        seed=args.base_seed,
-        offload_model=args.offload_model)
+    
+    if args.use_sliding_window:
+        # Use sliding window for long video generation
+        logging.info(f"Using sliding window mechanism for long video generation")
+        logging.info(f"  Window size: {args.window_size}")
+        if args.overlap_size is None:
+            args.overlap_size = args.window_size // 2
+        logging.info(f"  Overlap size: {args.overlap_size}")
+        logging.info(f"  Blend mode: {args.blend_mode}")
+        
+        from wan.sliding_window_i2v import SlidingWindowI2V
+        sliding_window_i2v = SlidingWindowI2V(
+            wan_i2v=wan_i2v,
+            window_size=args.window_size,
+            overlap_size=args.overlap_size,
+            blend_mode=args.blend_mode,
+        )
+        
+        video = sliding_window_i2v.generate_sliding_window(
+            img=img,
+            input_prompt=args.prompt,
+            frame_num=args.frame_num,
+            max_area=MAX_AREA_CONFIGS[args.size],
+            guide_scale=args.sample_guide_scale,
+            seed=args.base_seed,
+            n_prompt="",
+            action_path=args.action_path,
+            sample_steps=args.sample_steps,
+            sample_shift=args.sample_shift,
+            sample_guide_scale=args.sample_guide_scale,
+            sample_solver=args.sample_solver,
+            offload_model=args.offload_model)
+    else:
+        # Standard generation
+        video = wan_i2v.generate(
+            args.prompt,
+            img,
+            action_path=args.action_path,
+            max_area=MAX_AREA_CONFIGS[args.size],
+            frame_num=args.frame_num,
+            shift=args.sample_shift,
+            sample_solver=args.sample_solver,
+            sampling_steps=args.sample_steps,
+            guide_scale=args.sample_guide_scale,
+            seed=args.base_seed,
+            offload_model=args.offload_model)
 
     if rank == 0:
         if args.save_file is None:
