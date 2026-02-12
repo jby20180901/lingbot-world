@@ -296,9 +296,8 @@ class SlidingWindowI2V:
                 seed=seed + window_idx if seed >= 0 else -1,
                 n_prompt=n_prompt,
                 action_path=window_action_path,
-                sample_steps=sample_steps,
-                sample_shift=sample_shift,
-                sample_guide_scale=sample_guide_scale,
+                sampling_steps=sample_steps,
+                shift=sample_shift,
                 sample_solver=sample_solver,
                 offload_model=offload_model,
             )
@@ -384,25 +383,38 @@ class SlidingWindowI2V:
             return video
         
         stitched_frames = []
-        stride = self.window_size - self.overlap_size
         
         for idx, video in enumerate(video_segments):
             if idx == 0:
-                # First segment: use all frames except overlap region
-                frames_to_take = video.shape[1] - self.overlap_size
-                stitched_frames.append(video[:, :frames_to_take, :, :])
+                # First segment: use all frames except overlap region at the end
+                stitched_frames.append(video[:, :-self.overlap_size, :, :])
+                
+                # Blend the overlap region with the next segment
+                if len(video_segments) > 1:
+                    next_video = video_segments[idx + 1]
+                    blended = self._blend_video_frames(
+                        video[:, -self.overlap_size:, :, :],
+                        next_video[:, :self.overlap_size, :, :],
+                    )
+                    stitched_frames.append(blended)
+                    
             elif idx == len(video_segments) - 1:
-                # Last segment: use all frames after overlap region
+                # Last segment: use all frames after the overlap region
+                # (overlap was already handled in previous iteration)
                 stitched_frames.append(video[:, self.overlap_size:, :, :])
+                
             else:
-                # Middle segments: blend and take unique frames
-                prev_video = video_segments[idx - 1]
+                # Middle segments: skip overlap region at start (already blended)
+                # and blend with next segment
+                stitched_frames.append(video[:, self.overlap_size:, :, :])
+                
+                # Blend the overlap region with the next segment
+                next_video = video_segments[idx + 1]
                 blended = self._blend_video_frames(
-                    prev_video[:, -self.overlap_size:, :, :],
-                    video[:, :self.overlap_size, :, :],
+                    video[:, -self.overlap_size:, :, :],
+                    next_video[:, :self.overlap_size, :, :],
                 )
                 stitched_frames.append(blended)
-                stitched_frames.append(video[:, self.overlap_size:, :, :])
         
         # Concatenate all frames
         stitched_video = torch.cat(stitched_frames, dim=1)
