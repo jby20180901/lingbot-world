@@ -103,6 +103,8 @@ class SlidingWindowI2V:
             raise ValueError(f"Window size must be of form 4n+1, got {window_size}")
         
         # Overlap should be less than window size
+        if self.overlap_size < 0:
+            raise ValueError(f"Overlap size ({self.overlap_size}) must be >= 0")
         if self.overlap_size >= window_size:
             raise ValueError(f"Overlap size ({self.overlap_size}) must be < window size ({window_size})")
         
@@ -166,6 +168,9 @@ class SlidingWindowI2V:
         """
         if len(all_latents) == 1:
             return all_latents[0]
+
+        if self.overlap_size == 0:
+            return torch.cat(all_latents, dim=1)
         
         stitched_frames = []
         
@@ -192,7 +197,7 @@ class SlidingWindowI2V:
             else:
                 # Middle windows: skip overlap region at start (already blended)
                 # and blend with next latent
-                stitched_frames.append(latents[:, self.overlap_size:, :, :])
+                stitched_frames.append(latents[:, self.overlap_size:-self.overlap_size, :, :])
                 
                 # Blend the overlap region with the next latent
                 next_latents = all_latents[idx + 1]
@@ -227,6 +232,20 @@ class SlidingWindowI2V:
         end_frame = min(start_frame + self.window_size, total_frames)
         
         return start_frame, end_frame
+
+    def _compute_num_windows(self, total_frames: int, window_size: Optional[int] = None, overlap_size: Optional[int] = None) -> int:
+        """Compute number of windows needed to cover total_frames with overlap."""
+        if total_frames <= 0:
+            raise ValueError(f"total_frames must be > 0, got {total_frames}")
+
+        window = self.window_size if window_size is None else window_size
+        overlap = self.overlap_size if overlap_size is None else overlap_size
+        stride = window - overlap
+
+        if total_frames <= window:
+            return 1
+
+        return ((total_frames - window + stride - 1) // stride) + 1
     
     def _extract_reference_frame(
         self,
@@ -305,8 +324,9 @@ class SlidingWindowI2V:
             Generated video tensor [C, N, H, W]
         """
         # Calculate number of windows needed
-        stride = self.window_size - self.overlap_size
-        num_windows = (frame_num - 1 + stride - 1) // stride + 1
+        num_windows = self._compute_num_windows(frame_num)
+
+        effective_guide_scale = sample_guide_scale if sample_guide_scale is not None else guide_scale
         
         self.logger.info(f"Generating {frame_num} frames using sliding window")
         self.logger.info(f"  Window size: {self.window_size}")
@@ -327,6 +347,9 @@ class SlidingWindowI2V:
         for window_idx in tqdm(range(num_windows), desc="Processing windows"):
             window_start, window_end = self._get_window_frames(frame_num, window_idx)
             window_frames = window_end - window_start
+
+            if window_frames <= 0:
+                break
             
             # Adjust window size if this is the last window and it's smaller
             current_window_size = min(self.window_size, window_frames)
@@ -365,7 +388,7 @@ class SlidingWindowI2V:
                 input_prompt=input_prompt,
                 frame_num=current_window_size,
                 max_area=max_area,
-                guide_scale=guide_scale,
+                guide_scale=effective_guide_scale,
                 seed=window_seed,
                 n_prompt=n_prompt,
                 action_path=window_action_path,
@@ -463,6 +486,10 @@ class SlidingWindowI2V:
             if video.shape[1] > total_frames:
                 video = video[:, :total_frames, :, :]
             return video
+
+        if self.overlap_size == 0:
+            stitched_video = torch.cat(video_segments, dim=1)
+            return stitched_video[:, :total_frames, :, :] if stitched_video.shape[1] > total_frames else stitched_video
         
         stitched_frames = []
         
@@ -489,7 +516,7 @@ class SlidingWindowI2V:
                 # Middle segments: 
                 # Skip overlap region at start (already blended in previous iteration)
                 # and blend with next segment at the end
-                stitched_frames.append(video[:, self.overlap_size:, :, :])
+                stitched_frames.append(video[:, self.overlap_size:-self.overlap_size, :, :])
                 
                 # Blend the overlap region with the next segment
                 next_video = video_segments[idx + 1]
@@ -617,8 +644,7 @@ class SlidingWindowI2V:
             )
         
         # Calculate number of windows
-        stride = self.window_size - self.overlap_size
-        num_windows = (frame_num - 1 + stride - 1) // stride + 1
+        num_windows = self._compute_num_windows(frame_num)
         
         self.logger.info(f"Generating {frame_num} frames using sliding window WITH LATENT STITCHING")
         self.logger.info(f"  Window size: {self.window_size}")
@@ -638,6 +664,9 @@ class SlidingWindowI2V:
         for window_idx in tqdm(range(num_windows), desc="Processing windows (Latent)"):
             window_start, window_end = self._get_window_frames(frame_num, window_idx)
             window_frames = window_end - window_start
+
+            if window_frames <= 0:
+                break
             
             current_window_size = min(self.window_size, window_frames)
             if (current_window_size - 1) % 4 != 0:
@@ -755,8 +784,11 @@ class SlidingWindowI2V:
             config['use_autoregressive'] = False
         
         # Calculate estimated number of windows
-        stride = config['window_size'] - config['overlap_size']
-        num_windows = (total_frames - 1 + stride - 1) // stride + 1
+        num_windows = self._compute_num_windows(
+            total_frames,
+            window_size=config['window_size'],
+            overlap_size=config['overlap_size'],
+        )
         
         config['num_windows'] = num_windows
         config['estimated_unique_frames'] = total_frames

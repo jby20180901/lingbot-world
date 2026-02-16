@@ -60,7 +60,10 @@ def test_sliding_window_memory():
         window_size = 49
         overlap_size = 24
         stride = window_size - overlap_size
-        num_windows = (total_frames - 1 + stride - 1) // stride + 1
+        if total_frames <= window_size:
+            num_windows = 1
+        else:
+            num_windows = ((total_frames - window_size + stride - 1) // stride) + 1
         
         original_memory = total_frames * 0.1  # ~100MB per frame in latent space
         sliding_memory = window_size * 0.1    # Only one window at a time
@@ -139,7 +142,10 @@ def test_window_calculation():
     
     total_frames = 200
     stride = 49 - 24
-    num_windows = (total_frames - 1 + stride - 1) // stride + 1
+    if total_frames <= 49:
+        num_windows = 1
+    else:
+        num_windows = ((total_frames - 49 + stride - 1) // stride) + 1
     
     for window_idx in range(num_windows):
         start, end = sw._get_window_frames(total_frames, window_idx)
