@@ -27,6 +27,7 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .utils.diffusion_utils import IntermediateResultSaver
 from .utils.cam_utils import (
     compute_relative_poses,
     interpolate_camera_poses,
@@ -221,7 +222,10 @@ class WanI2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 save_intermediate_dir=None,
+                 save_latents=True,
+                 save_decoded=False):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -414,6 +418,15 @@ class WanI2V:
             else:
                 raise NotImplementedError("Unsupported solver.")
 
+            result_saver = None
+            if save_intermediate_dir is not None and self.rank == 0:
+                result_saver = IntermediateResultSaver(
+                    save_dir=save_intermediate_dir,
+                    save_latents=save_latents,
+                    save_decoded=save_decoded,
+                    vae=self.vae if save_decoded else None,
+                )
+
             # sample videos
             latent = noise
 
@@ -434,7 +447,7 @@ class WanI2V:
             if offload_model:
                 torch.cuda.empty_cache()
 
-            for _, t in enumerate(tqdm(timesteps)):
+            for step_idx, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
 
@@ -464,6 +477,15 @@ class WanI2V:
                     generator=seed_g)[0]
                 latent = temp_x0.squeeze(0)
 
+                if result_saver is not None:
+                    result_saver.save_step_results(
+                        latents=latent,
+                        step=t.item(),
+                        step_idx=step_idx,
+                        frame_num=frame_num,
+                        vae_stride=self.vae_stride,
+                    )
+
                 x0 = [latent]
                 del latent_model_input, timestep
 
@@ -482,5 +504,9 @@ class WanI2V:
             torch.cuda.synchronize()
         if dist.is_initialized():
             dist.barrier()
+
+        if result_saver is not None and self.rank == 0:
+            result_saver.save_final_result(videos[0], "final_video.pt")
+            result_saver.get_summary()
 
         return videos[0] if self.rank == 0 else None

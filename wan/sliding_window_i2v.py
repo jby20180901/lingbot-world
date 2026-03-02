@@ -295,6 +295,9 @@ class SlidingWindowI2V:
         offload_model: bool = True,
         use_autoregressive: bool = True,
         seed_mode: str = "uniform",
+        save_intermediate_dir: Optional[str] = None,
+        save_latents: bool = True,
+        save_decoded: bool = False,
     ) -> torch.Tensor:
         """
         Generate long video using sliding window mechanism with autoregressive conditioning.
@@ -383,6 +386,10 @@ class SlidingWindowI2V:
                 window_seed = -1
             
             # Generate video for this window
+            window_save_dir = None
+            if save_intermediate_dir is not None:
+                window_save_dir = os.path.join(save_intermediate_dir, f"window_{window_idx:03d}")
+
             window_video = self.wan_i2v.generate(
                 img=current_input_img,
                 input_prompt=input_prompt,
@@ -396,6 +403,9 @@ class SlidingWindowI2V:
                 shift=sample_shift,
                 sample_solver=sample_solver,
                 offload_model=offload_model,
+                save_intermediate_dir=window_save_dir,
+                save_latents=save_latents,
+                save_decoded=save_decoded,
             )
             
             if window_video is not None:
