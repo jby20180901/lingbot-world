@@ -9,6 +9,7 @@ warnings.filterwarnings('ignore')
 
 import random
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from PIL import Image
@@ -226,6 +227,16 @@ def _parse_args():
         type=str2bool,
         default=False,
         help="Whether to decode and save RGB frames for each diffusion step when --save_intermediate_dir is set.")
+    parser.add_argument(
+        "--save_camera_matrices",
+        type=str2bool,
+        default=False,
+        help="Whether to save per-frame camera matrices to an npz file.")
+    parser.add_argument(
+        "--camera_matrices_file",
+        type=str,
+        default=None,
+        help="Optional output npz path for per-frame camera matrices. Default: <save_file>.camera_matrices.npz")
     
     args = parser.parse_args()
     _validate_args(args)
@@ -243,6 +254,52 @@ def _init_logging(rank):
             handlers=[logging.StreamHandler(stream=sys.stdout)])
     else:
         logging.basicConfig(level=logging.ERROR)
+
+
+def _save_frame_camera_matrices(action_path, save_npz_path, frame_count):
+    if action_path is None:
+        raise ValueError("action_path is required when saving camera matrices")
+
+    poses_path = os.path.join(action_path, "poses.npy")
+    intrinsics_path = os.path.join(action_path, "intrinsics.npy")
+
+    if not os.path.exists(poses_path):
+        raise FileNotFoundError(f"poses.npy not found: {poses_path}")
+    if not os.path.exists(intrinsics_path):
+        raise FileNotFoundError(f"intrinsics.npy not found: {intrinsics_path}")
+
+    c2ws = np.load(poses_path)
+    Ks = np.load(intrinsics_path)
+
+    if c2ws.ndim != 3 or c2ws.shape[1:] != (4, 4):
+        raise ValueError(f"Expected poses shape [N,4,4], got {c2ws.shape}")
+
+    if Ks.ndim == 2:
+        Ks = np.repeat(Ks[None, ...], repeats=c2ws.shape[0], axis=0)
+    elif Ks.ndim != 3 or Ks.shape[1:] != (3, 3):
+        raise ValueError(f"Expected intrinsics shape [3,3] or [N,3,3], got {Ks.shape}")
+
+    min_len = min(c2ws.shape[0], Ks.shape[0])
+    c2ws = c2ws[:min_len]
+    Ks = Ks[:min_len]
+
+    if min_len == 0:
+        raise ValueError("No valid camera poses/intrinsics found")
+
+    if min_len < frame_count:
+        pad_num = frame_count - min_len
+        c2ws = np.concatenate([c2ws, np.repeat(c2ws[-1:], repeats=pad_num, axis=0)], axis=0)
+        Ks = np.concatenate([Ks, np.repeat(Ks[-1:], repeats=pad_num, axis=0)], axis=0)
+    else:
+        c2ws = c2ws[:frame_count]
+        Ks = Ks[:frame_count]
+
+    np.savez(
+        save_npz_path,
+        frame_idx=np.arange(frame_count, dtype=np.int32),
+        c2w=c2ws.astype(np.float32),
+        K=Ks.astype(np.float32),
+    )
 
 
 def generate(args):
@@ -388,6 +445,21 @@ def generate(args):
             nrow=1,
             normalize=True,
             value_range=(-1, 1))
+
+        if args.save_camera_matrices:
+            if args.action_path is None:
+                logging.warning("save_camera_matrices is enabled but action_path is None, skip camera export")
+            else:
+                frame_count = int(video.shape[1])
+                camera_file = args.camera_matrices_file
+                if camera_file is None:
+                    camera_file = f"{args.save_file}.camera_matrices.npz"
+                _save_frame_camera_matrices(
+                    action_path=args.action_path,
+                    save_npz_path=camera_file,
+                    frame_count=frame_count)
+                logging.info(f"Saved per-frame camera matrices to {camera_file}")
+
         if "s2v" in args.task:
             if args.enable_tts is False:
                 merge_video_audio(video_path=args.save_file, audio_path=args.audio)
