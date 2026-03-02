@@ -353,13 +353,10 @@ class SlidingWindowI2V:
 
             if window_frames <= 0:
                 break
-            
-            # Adjust window size if this is the last window and it's smaller
-            current_window_size = min(self.window_size, window_frames)
-            
-            # Ensure window_size is still 4n+1
-            if (current_window_size - 1) % 4 != 0:
-                current_window_size = ((current_window_size - 1) // 4) * 4 + 1
+
+            # Keep exact frame count for this window so trajectory slicing
+            # aligns 1:1 with requested global frame indices.
+            current_window_size = window_frames
             
             self.logger.debug(f"Window {window_idx}: frames {window_start}-{window_end} "
                             f"(size={current_window_size})")
@@ -466,11 +463,15 @@ class SlidingWindowI2V:
         poses_path = os.path.join(temp_dir, "poses.npy")
         np.save(poses_path, window_poses)
         
-        # Copy intrinsics if they exist
+        # Copy/slice intrinsics if they exist
         intrinsics_src = os.path.join(original_action_path, "intrinsics.npy")
         if os.path.exists(intrinsics_src):
             intrinsics_dst = os.path.join(temp_dir, "intrinsics.npy")
-            shutil.copy(intrinsics_src, intrinsics_dst)
+            intrinsics = np.load(intrinsics_src)
+            if intrinsics.ndim == 3 and intrinsics.shape[0] >= end_frame:
+                np.save(intrinsics_dst, intrinsics[start_frame:end_frame])
+            else:
+                np.save(intrinsics_dst, intrinsics)
         
         return temp_dir
     
@@ -677,10 +678,10 @@ class SlidingWindowI2V:
 
             if window_frames <= 0:
                 break
-            
-            current_window_size = min(self.window_size, window_frames)
-            if (current_window_size - 1) % 4 != 0:
-                current_window_size = ((current_window_size - 1) // 4) * 4 + 1
+
+            # Keep exact frame count for this window so trajectory slicing
+            # aligns 1:1 with requested global frame indices.
+            current_window_size = window_frames
             
             window_action_path = None
             if action_path is not None and camera_poses is not None:
