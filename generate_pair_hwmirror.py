@@ -4,6 +4,7 @@ import sys
 import tempfile
 import subprocess
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,7 @@ import wan
 from wan.configs import MAX_AREA_CONFIGS, WAN_CONFIGS
 from wan.utils.cam_utils import interpolate_camera_poses
 from wan.utils.utils import save_video
+from tqdm import tqdm
 
 
 def _build_parser():
@@ -340,7 +342,9 @@ def generate_pair_hwmirror_video(pipeline, cfg, args):
     output_frames = []
 
     try:
-        for pair_idx in range(pair_count):
+        pair_iterator = tqdm(range(pair_count), desc="Pair-wise HWM guidance", unit="pair")
+        for pair_idx in pair_iterator:
+            pair_t0 = time.perf_counter()
             idx_a = pair_idx * 2
             idx_b = idx_a + 1
 
@@ -349,6 +353,7 @@ def generate_pair_hwmirror_video(pipeline, cfg, args):
 
             pair_action_dir = _make_pair_action_dir(poses_pair, intr_pair)
             try:
+                base_t0 = time.perf_counter()
                 base_video = pipeline.generate(
                     input_prompt=args.prompt,
                     img=image,
@@ -365,10 +370,12 @@ def generate_pair_hwmirror_video(pipeline, cfg, args):
                     save_latents=args.save_latents if hasattr(args, "save_latents") else True,
                     save_decoded=args.save_decoded if hasattr(args, "save_decoded") else False,
                 )
+                base_sec = time.perf_counter() - base_t0
 
                 first_frame = base_video[:, 0].detach().cpu().clamp(-1, 1)
                 first_frame_pil = to_pil_image((first_frame + 1.0) / 2.0)
 
+                render_t0 = time.perf_counter()
                 if args.hwm_use_subprocess:
                     rendered_guidance = bridge.render(
                         first_frame_pil=first_frame_pil,
@@ -386,7 +393,9 @@ def generate_pair_hwmirror_video(pipeline, cfg, args):
                         target_h=int(base_video.shape[2]),
                         target_w=int(base_video.shape[3]),
                     )
+                render_sec = time.perf_counter() - render_t0
 
+                guided_t0 = time.perf_counter()
                 guided_video = pipeline.generate(
                     input_prompt=args.prompt,
                     img=image,
@@ -409,11 +418,26 @@ def generate_pair_hwmirror_video(pipeline, cfg, args):
                     guidance_lambda_early=0.7,
                     guidance_lambda_mid=0.2,
                 )
+                guided_sec = time.perf_counter() - guided_t0
 
                 output_frames.append(base_video[:, 0].detach().cpu())
                 output_frames.append(guided_video[:, 4].detach().cpu())
 
                 image = to_pil_image(((guided_video[:, 4].detach().cpu().clamp(-1, 1) + 1.0) / 2.0))
+
+                pair_sec = time.perf_counter() - pair_t0
+                pair_iterator.set_postfix(
+                    base_s=f"{base_sec:.1f}",
+                    render_s=f"{render_sec:.1f}",
+                    guided_s=f"{guided_sec:.1f}",
+                    total_s=f"{pair_sec:.1f}",
+                    refresh=True,
+                )
+                print(
+                    f"[pair_hwmirror] pair {pair_idx + 1}/{pair_count} "
+                    f"base={base_sec:.2f}s render={render_sec:.2f}s guided={guided_sec:.2f}s total={pair_sec:.2f}s",
+                    flush=True,
+                )
             finally:
                 import shutil
                 shutil.rmtree(pair_action_dir, ignore_errors=True)
