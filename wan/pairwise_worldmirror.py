@@ -153,5 +153,19 @@ def _create_single_pose_action_dir(pose: np.ndarray, intrinsic: Optional[np.ndar
     temp_dir = tempfile.mkdtemp(prefix="pair_action_")
     np.save(os.path.join(temp_dir, "poses.npy"), pose[None, ...].astype(np.float32))
     if intrinsic is not None:
-        np.save(os.path.join(temp_dir, "intrinsics.npy"), intrinsic[None, ...].astype(np.float32))
+        intr = np.asarray(intrinsic)
+        if intr.ndim == 1 and intr.shape[0] == 4:
+            intr_save = intr[None, :]
+        elif intr.ndim == 2 and intr.shape == (3, 3):
+            intr_save = intr[None, :, :]
+        elif intr.ndim == 2 and intr.shape[-1] == 4:
+            intr_save = intr[:1, :]
+        elif intr.ndim == 3 and intr.shape[-2:] == (3, 3):
+            intr_save = intr[:1, :, :]
+        elif intr.ndim == 3 and intr.shape[-1] == 4:
+            intr_save = intr.reshape(-1, 4)[:1, :]
+        else:
+            raise ValueError(f"Unsupported intrinsic shape for pairwise action: {intr.shape}")
+
+        np.save(os.path.join(temp_dir, "intrinsics.npy"), intr_save.astype(np.float32))
     return temp_dir

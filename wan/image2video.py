@@ -38,6 +38,39 @@ from .utils.cam_utils import (
 from einops import rearrange
 
 
+def _intrinsics_to_fxfycxcy_tensor(intrinsics_np: np.ndarray) -> torch.Tensor:
+    arr = np.asarray(intrinsics_np)
+
+    if arr.ndim == 1 and arr.shape[0] == 4:
+        return torch.from_numpy(arr[None, :].astype(np.float32))
+
+    if arr.ndim == 2:
+        if arr.shape == (3, 3):
+            fx, fy = arr[0, 0], arr[1, 1]
+            cx, cy = arr[0, 2], arr[1, 2]
+            vec = np.array([[fx, fy, cx, cy]], dtype=np.float32)
+            return torch.from_numpy(vec)
+        if arr.shape[-1] == 4:
+            return torch.from_numpy(arr.astype(np.float32))
+
+    if arr.ndim == 3:
+        if arr.shape[-2:] == (3, 3):
+            fx = arr[:, 0, 0]
+            fy = arr[:, 1, 1]
+            cx = arr[:, 0, 2]
+            cy = arr[:, 1, 2]
+            vec = np.stack([fx, fy, cx, cy], axis=-1).astype(np.float32)
+            return torch.from_numpy(vec)
+        if arr.shape[-1] == 4:
+            if arr.shape[0] == 1:
+                arr = arr[0]
+            else:
+                arr = arr.reshape(-1, 4)
+            return torch.from_numpy(arr.astype(np.float32))
+
+    raise ValueError(f"Unsupported intrinsics shape: {arr.shape}. Expected [4], [N,4], [3,3], [N,3,3] or [1,N,4].")
+
+
 class WanI2V:
 
     def __init__(
@@ -337,7 +370,8 @@ class WanI2V:
         # cam preparation (only if action_path is provided)
         dit_cond_dict = None
         if action_path is not None:
-            Ks = torch.from_numpy(np.load(os.path.join(action_path, "intrinsics.npy"))).float()
+            Ks_np = np.load(os.path.join(action_path, "intrinsics.npy"))
+            Ks = _intrinsics_to_fxfycxcy_tensor(Ks_np).float()
             if Ks.ndim == 2 and Ks.shape == (3, 3):
                 frame_camera_intrinsics = Ks.unsqueeze(0).repeat(frame_num, 1, 1)
             elif Ks.ndim == 3 and Ks.shape[1:] == (3, 3):
