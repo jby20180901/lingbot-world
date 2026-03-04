@@ -248,6 +248,21 @@ def _parse_args():
         default="../HunyuanWorld-Mirror",
         help="Path to HunyuanWorld-Mirror repository for pair-wise guidance flow.")
     parser.add_argument(
+        "--hwm_use_subprocess",
+        type=str2bool,
+        default=True,
+        help="Run HunyuanWorld-Mirror rendering via subprocess so Lingbot and HWM can use separate conda envs.")
+    parser.add_argument(
+        "--hwm_conda_env",
+        type=str,
+        default=None,
+        help="Conda env name used when --hwm_use_subprocess is true (example: hunyuanworld-mirror).")
+    parser.add_argument(
+        "--hwm_python",
+        type=str,
+        default=None,
+        help="Optional Python executable path for HWM subprocess. If set, it overrides --hwm_conda_env.")
+    parser.add_argument(
         "--guidance_fft_radius",
         type=int,
         default=10,
@@ -367,6 +382,8 @@ def generate(args):
 
     if args.use_pair_hwmirror and args.action_path is None:
         raise ValueError("action_path is required when use_pair_hwmirror is enabled")
+    if args.use_pair_hwmirror and args.hwm_use_subprocess and args.hwm_conda_env is None and args.hwm_python is None:
+        raise ValueError("When use_pair_hwmirror and hwm_use_subprocess are enabled, provide hwm_conda_env or hwm_python")
 
     # prompt extend
     if args.use_prompt_extend:

@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import tempfile
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +30,9 @@ def _build_parser():
     parser.add_argument("--base_seed", type=int, default=42)
     parser.add_argument("--save_file", type=str, default="pair_hwmirror_output.mp4")
     parser.add_argument("--hwm_repo", type=str, default="../HunyuanWorld-Mirror")
+    parser.add_argument("--hwm_conda_env", type=str, default=None, help="Conda env name for HunyuanWorld-Mirror rendering subprocess.")
+    parser.add_argument("--hwm_python", type=str, default=None, help="Python executable path for HunyuanWorld-Mirror rendering subprocess.")
+    parser.add_argument("--hwm_use_subprocess", action="store_true", help="Use subprocess bridge to run HunyuanWorld-Mirror rendering in a separate environment.")
     parser.add_argument("--guidance_fft_radius", type=int, default=10)
     return parser
 
@@ -101,6 +105,58 @@ def _render_with_hwm(hwm_app, first_frame_pil: Image.Image, pose_b: np.ndarray, 
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def _render_with_hwm_subprocess(first_frame_pil, pose_b, intr_b, target_h, target_w, args):
+    temp_root = tempfile.mkdtemp(prefix="hwm_subproc_")
+    try:
+        input_image = Path(temp_root) / "input.png"
+        pose_file = Path(temp_root) / "pose.npy"
+        intr_file = Path(temp_root) / "intrinsics.npy"
+        output_png = Path(temp_root) / "rendered.png"
+
+        first_frame_pil.save(input_image)
+        np.save(pose_file, pose_b.astype(np.float32))
+        np.save(intr_file, intr_b.astype(np.float32))
+
+        bridge_script = Path(__file__).with_name("hwm_render_bridge.py")
+
+        if args.hwm_python is not None:
+            cmd = [
+                args.hwm_python,
+                str(bridge_script),
+            ]
+        elif args.hwm_conda_env is not None:
+            cmd = [
+                "conda",
+                "run",
+                "-n",
+                args.hwm_conda_env,
+                "python",
+                str(bridge_script),
+            ]
+        else:
+            raise ValueError("hwm_use_subprocess enabled but neither hwm_conda_env nor hwm_python is provided")
+
+        cmd.extend([
+            "--hwm_repo", str(args.hwm_repo),
+            "--input_image", str(input_image),
+            "--pose_file", str(pose_file),
+            "--intrinsics_file", str(intr_file),
+            "--target_h", str(int(target_h)),
+            "--target_w", str(int(target_w)),
+            "--output_png", str(output_png),
+        ])
+
+        subprocess.run(cmd, check=True)
+
+        rendered = Image.open(output_png).convert("RGB")
+        rendered_np = np.asarray(rendered, dtype=np.float32) / 255.0
+        rendered_tensor = torch.from_numpy(rendered_np).permute(2, 0, 1)
+        return rendered_tensor.mul(2.0).sub(1.0)
+    finally:
+        import shutil
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
 def _make_pair_action_dir(poses_pair: np.ndarray, intr_pair: np.ndarray):
     src_indices = np.array([0.0, 1.0], dtype=np.float32)
     tgt_indices = np.linspace(0.0, 1.0, 5, dtype=np.float32)
@@ -142,7 +198,9 @@ def generate_pair_hwmirror_video(pipeline, cfg, args):
     if pair_count <= 0:
         raise ValueError("Need at least 2 poses for pair-wise process")
 
-    hwm_app = _load_hwm_app(args.hwm_repo)
+    hwm_app = None
+    if not args.hwm_use_subprocess:
+        hwm_app = _load_hwm_app(args.hwm_repo)
     output_frames = []
 
     for pair_idx in range(pair_count):
@@ -174,14 +232,24 @@ def generate_pair_hwmirror_video(pipeline, cfg, args):
             first_frame = base_video[:, 0].detach().cpu().clamp(-1, 1)
             first_frame_pil = to_pil_image((first_frame + 1.0) / 2.0)
 
-            rendered_guidance = _render_with_hwm(
-                hwm_app=hwm_app,
-                first_frame_pil=first_frame_pil,
-                pose_b=poses_pair[1],
-                intr_b=intr_pair[1],
-                target_h=int(base_video.shape[2]),
-                target_w=int(base_video.shape[3]),
-            )
+            if args.hwm_use_subprocess:
+                rendered_guidance = _render_with_hwm_subprocess(
+                    first_frame_pil=first_frame_pil,
+                    pose_b=poses_pair[1],
+                    intr_b=intr_pair[1],
+                    target_h=int(base_video.shape[2]),
+                    target_w=int(base_video.shape[3]),
+                    args=args,
+                )
+            else:
+                rendered_guidance = _render_with_hwm(
+                    hwm_app=hwm_app,
+                    first_frame_pil=first_frame_pil,
+                    pose_b=poses_pair[1],
+                    intr_b=intr_pair[1],
+                    target_h=int(base_video.shape[2]),
+                    target_w=int(base_video.shape[3]),
+                )
 
             guided_video = pipeline.generate(
                 input_prompt=args.prompt,
