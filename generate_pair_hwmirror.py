@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import subprocess
+import json
 from pathlib import Path
 
 import numpy as np
@@ -167,6 +168,82 @@ def _render_with_hwm_subprocess(first_frame_pil, pose_b, intr_b, target_h, targe
         shutil.rmtree(temp_root, ignore_errors=True)
 
 
+class PersistentHWMBridge:
+    def __init__(self, args):
+        bridge_script = Path(__file__).with_name("hwm_render_bridge.py")
+        if args.hwm_python is not None:
+            cmd = [args.hwm_python, str(bridge_script), "--server", "--hwm_repo", str(args.hwm_repo)]
+        elif args.hwm_conda_env is not None:
+            cmd = [
+                "conda", "run", "-n", args.hwm_conda_env,
+                "python", str(bridge_script), "--server", "--hwm_repo", str(args.hwm_repo)
+            ]
+        else:
+            raise ValueError("hwm_use_subprocess enabled but neither hwm_conda_env nor hwm_python is provided")
+
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            text=True,
+            bufsize=1,
+        )
+
+    def render(self, first_frame_pil, pose_b, intr_b, target_h, target_w):
+        temp_root = tempfile.mkdtemp(prefix="hwm_subproc_req_")
+        try:
+            input_image = Path(temp_root) / "input.png"
+            pose_file = Path(temp_root) / "pose.npy"
+            intr_file = Path(temp_root) / "intrinsics.npy"
+            output_png = Path(temp_root) / "rendered.png"
+
+            first_frame_pil.save(input_image)
+            np.save(pose_file, pose_b.astype(np.float32))
+            np.save(intr_file, intr_b.astype(np.float32))
+
+            req = {
+                "input_image": str(input_image),
+                "pose_file": str(pose_file),
+                "intrinsics_file": str(intr_file),
+                "target_h": int(target_h),
+                "target_w": int(target_w),
+                "output_png": str(output_png),
+            }
+
+            if self.proc.stdin is None or self.proc.stdout is None:
+                raise RuntimeError("HWM bridge process pipes are unavailable")
+
+            self.proc.stdin.write(json.dumps(req) + "\n")
+            self.proc.stdin.flush()
+            line = self.proc.stdout.readline().strip()
+            if not line:
+                raise RuntimeError("HWM bridge returned empty response")
+            resp = json.loads(line)
+            if not resp.get("ok", False):
+                raise RuntimeError(f"HWM bridge error: {resp.get('error', 'unknown error')}")
+
+            rendered = Image.open(output_png).convert("RGB")
+            rendered_np = np.asarray(rendered, dtype=np.float32) / 255.0
+            rendered_tensor = torch.from_numpy(rendered_np).permute(2, 0, 1)
+            return rendered_tensor.mul(2.0).sub(1.0)
+        finally:
+            import shutil
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+    def close(self):
+        try:
+            if self.proc.stdin is not None and self.proc.stdout is not None and self.proc.poll() is None:
+                self.proc.stdin.write(json.dumps({"cmd": "shutdown"}) + "\n")
+                self.proc.stdin.flush()
+                self.proc.stdout.readline()
+        except Exception:
+            pass
+        finally:
+            if self.proc.poll() is None:
+                self.proc.terminate()
+
+
 def _make_pair_action_dir(poses_pair: np.ndarray, intr_pair: np.ndarray):
     src_indices = np.array([0.0, 1.0], dtype=np.float32)
     tgt_indices = np.linspace(0.0, 1.0, 5, dtype=np.float32)
@@ -212,6 +289,10 @@ def generate_pair_hwmirror_video(pipeline, cfg, args):
     poses = np.load(os.path.join(args.action_path, "poses.npy")).astype(np.float32)
     intr = np.load(os.path.join(args.action_path, "intrinsics.npy")).astype(np.float32)
 
+    requested_frames = int(getattr(args, "frame_num", 0) or 0)
+    if requested_frames > 0:
+        poses = poses[:requested_frames]
+
     if intr.ndim == 1 and intr.shape[0] == 4:
         intr = np.repeat(intr[None, :], repeats=poses.shape[0], axis=0)
     elif intr.ndim == 2 and intr.shape[-1] == 4:
@@ -238,6 +319,9 @@ def generate_pair_hwmirror_video(pipeline, cfg, args):
         pad = poses.shape[0] - intr.shape[0]
         intr = np.concatenate([intr, np.repeat(intr[-1:], repeats=pad, axis=0)], axis=0)
 
+    if requested_frames > 0:
+        intr = intr[:requested_frames]
+
     if intr.ndim != 2 or intr.shape[1] != 4:
         raise ValueError(f"Canonical intrinsics must be [N,4], got {intr.shape}")
 
@@ -245,89 +329,97 @@ def generate_pair_hwmirror_video(pipeline, cfg, args):
     if pair_count <= 0:
         raise ValueError("Need at least 2 poses for pair-wise process")
 
+    print(f"[pair_hwmirror] requested_frames={requested_frames if requested_frames > 0 else 'all'}, used_frames={pair_count * 2}, pair_count={pair_count}")
+
     hwm_app = None
+    bridge = None
     if not args.hwm_use_subprocess:
         hwm_app = _load_hwm_app(args.hwm_repo)
+    else:
+        bridge = PersistentHWMBridge(args)
     output_frames = []
 
-    for pair_idx in range(pair_count):
-        idx_a = pair_idx * 2
-        idx_b = idx_a + 1
+    try:
+        for pair_idx in range(pair_count):
+            idx_a = pair_idx * 2
+            idx_b = idx_a + 1
 
-        poses_pair = poses[[idx_a, idx_b]]
-        intr_pair = intr[[idx_a, idx_b]]
+            poses_pair = poses[[idx_a, idx_b]]
+            intr_pair = intr[[idx_a, idx_b]]
 
-        pair_action_dir = _make_pair_action_dir(poses_pair, intr_pair)
-        try:
-            base_video = pipeline.generate(
-                input_prompt=args.prompt,
-                img=image,
-                action_path=pair_action_dir,
-                max_area=MAX_AREA_CONFIGS[args.size],
-                frame_num=5,
-                shift=sample_shift,
-                sample_solver=args.sample_solver,
-                sampling_steps=sample_steps,
-                guide_scale=guide_scale,
-                seed=args.base_seed + pair_idx,
-                offload_model=args.offload_model if hasattr(args, "offload_model") else True,
-                save_intermediate_dir=args.save_intermediate_dir if hasattr(args, "save_intermediate_dir") else None,
-                save_latents=args.save_latents if hasattr(args, "save_latents") else True,
-                save_decoded=args.save_decoded if hasattr(args, "save_decoded") else False,
-            )
-
-            first_frame = base_video[:, 0].detach().cpu().clamp(-1, 1)
-            first_frame_pil = to_pil_image((first_frame + 1.0) / 2.0)
-
-            if args.hwm_use_subprocess:
-                rendered_guidance = _render_with_hwm_subprocess(
-                    first_frame_pil=first_frame_pil,
-                    pose_b=poses_pair[1],
-                    intr_b=intr_pair[1],
-                    target_h=int(base_video.shape[2]),
-                    target_w=int(base_video.shape[3]),
-                    args=args,
-                )
-            else:
-                rendered_guidance = _render_with_hwm(
-                    hwm_app=hwm_app,
-                    first_frame_pil=first_frame_pil,
-                    pose_b=poses_pair[1],
-                    intr_b=intr_pair[1],
-                    target_h=int(base_video.shape[2]),
-                    target_w=int(base_video.shape[3]),
+            pair_action_dir = _make_pair_action_dir(poses_pair, intr_pair)
+            try:
+                base_video = pipeline.generate(
+                    input_prompt=args.prompt,
+                    img=image,
+                    action_path=pair_action_dir,
+                    max_area=MAX_AREA_CONFIGS[args.size],
+                    frame_num=5,
+                    shift=sample_shift,
+                    sample_solver=args.sample_solver,
+                    sampling_steps=sample_steps,
+                    guide_scale=guide_scale,
+                    seed=args.base_seed + pair_idx,
+                    offload_model=args.offload_model if hasattr(args, "offload_model") else True,
+                    save_intermediate_dir=args.save_intermediate_dir if hasattr(args, "save_intermediate_dir") else None,
+                    save_latents=args.save_latents if hasattr(args, "save_latents") else True,
+                    save_decoded=args.save_decoded if hasattr(args, "save_decoded") else False,
                 )
 
-            guided_video = pipeline.generate(
-                input_prompt=args.prompt,
-                img=image,
-                action_path=pair_action_dir,
-                max_area=MAX_AREA_CONFIGS[args.size],
-                frame_num=5,
-                shift=sample_shift,
-                sample_solver=args.sample_solver,
-                sampling_steps=sample_steps,
-                guide_scale=guide_scale,
-                seed=args.base_seed + pair_idx,
-                offload_model=args.offload_model if hasattr(args, "offload_model") else True,
-                save_intermediate_dir=args.save_intermediate_dir if hasattr(args, "save_intermediate_dir") else None,
-                save_latents=args.save_latents if hasattr(args, "save_latents") else True,
-                save_decoded=args.save_decoded if hasattr(args, "save_decoded") else False,
-                guidance_frame_tensors={4: rendered_guidance},
-                guidance_fft_radius=getattr(args, "guidance_fft_radius", 10),
-                guidance_early_step_end=15,
-                guidance_mid_step_end=30,
-                guidance_lambda_early=0.7,
-                guidance_lambda_mid=0.2,
-            )
+                first_frame = base_video[:, 0].detach().cpu().clamp(-1, 1)
+                first_frame_pil = to_pil_image((first_frame + 1.0) / 2.0)
 
-            output_frames.append(base_video[:, 0].detach().cpu())
-            output_frames.append(guided_video[:, 4].detach().cpu())
+                if args.hwm_use_subprocess:
+                    rendered_guidance = bridge.render(
+                        first_frame_pil=first_frame_pil,
+                        pose_b=poses_pair[1],
+                        intr_b=intr_pair[1],
+                        target_h=int(base_video.shape[2]),
+                        target_w=int(base_video.shape[3]),
+                    )
+                else:
+                    rendered_guidance = _render_with_hwm(
+                        hwm_app=hwm_app,
+                        first_frame_pil=first_frame_pil,
+                        pose_b=poses_pair[1],
+                        intr_b=intr_pair[1],
+                        target_h=int(base_video.shape[2]),
+                        target_w=int(base_video.shape[3]),
+                    )
 
-            image = to_pil_image(((guided_video[:, 4].detach().cpu().clamp(-1, 1) + 1.0) / 2.0))
-        finally:
-            import shutil
-            shutil.rmtree(pair_action_dir, ignore_errors=True)
+                guided_video = pipeline.generate(
+                    input_prompt=args.prompt,
+                    img=image,
+                    action_path=pair_action_dir,
+                    max_area=MAX_AREA_CONFIGS[args.size],
+                    frame_num=5,
+                    shift=sample_shift,
+                    sample_solver=args.sample_solver,
+                    sampling_steps=sample_steps,
+                    guide_scale=guide_scale,
+                    seed=args.base_seed + pair_idx,
+                    offload_model=args.offload_model if hasattr(args, "offload_model") else True,
+                    save_intermediate_dir=args.save_intermediate_dir if hasattr(args, "save_intermediate_dir") else None,
+                    save_latents=args.save_latents if hasattr(args, "save_latents") else True,
+                    save_decoded=args.save_decoded if hasattr(args, "save_decoded") else False,
+                    guidance_frame_tensors={4: rendered_guidance},
+                    guidance_fft_radius=getattr(args, "guidance_fft_radius", 10),
+                    guidance_early_step_end=15,
+                    guidance_mid_step_end=30,
+                    guidance_lambda_early=0.7,
+                    guidance_lambda_mid=0.2,
+                )
+
+                output_frames.append(base_video[:, 0].detach().cpu())
+                output_frames.append(guided_video[:, 4].detach().cpu())
+
+                image = to_pil_image(((guided_video[:, 4].detach().cpu().clamp(-1, 1) + 1.0) / 2.0))
+            finally:
+                import shutil
+                shutil.rmtree(pair_action_dir, ignore_errors=True)
+    finally:
+        if bridge is not None:
+            bridge.close()
 
     final_video = torch.stack(output_frames, dim=1)
     return final_video
