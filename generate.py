@@ -237,6 +237,21 @@ def _parse_args():
         type=str,
         default=None,
         help="Optional output npz path for per-frame camera matrices. Default: <save_file>.camera_matrices.npz")
+    parser.add_argument(
+        "--use_pair_hwmirror",
+        type=str2bool,
+        default=False,
+        help="Whether to use pair-wise (2 poses per group) HunyuanWorld-Mirror complementary guidance flow.")
+    parser.add_argument(
+        "--hwm_repo",
+        type=str,
+        default="../HunyuanWorld-Mirror",
+        help="Path to HunyuanWorld-Mirror repository for pair-wise guidance flow.")
+    parser.add_argument(
+        "--guidance_fft_radius",
+        type=int,
+        default=10,
+        help="FFT radius used for low/high frequency complementary filtering when --use_pair_hwmirror is enabled.")
     
     args = parser.parse_args()
     _validate_args(args)
@@ -350,6 +365,9 @@ def generate(args):
         img = Image.open(args.image).convert("RGB")
         logging.info(f"Input image: {args.image}")
 
+    if args.use_pair_hwmirror and args.action_path is None:
+        raise ValueError("action_path is required when use_pair_hwmirror is enabled")
+
     # prompt extend
     if args.use_prompt_extend:
         logging.info("Extending prompt ...")
@@ -377,7 +395,14 @@ def generate(args):
     )
     logging.info("Generating video ...")
     
-    if args.use_sliding_window:
+    if args.use_pair_hwmirror:
+        from generate_pair_hwmirror import generate_pair_hwmirror_video
+        video = generate_pair_hwmirror_video(
+            pipeline=wan_i2v,
+            cfg=cfg,
+            args=args,
+        )
+    elif args.use_sliding_window:
         # Use sliding window for long video generation
         logging.info(f"Using sliding window mechanism for long video generation")
         logging.info(f"  Window size: {args.window_size}")
