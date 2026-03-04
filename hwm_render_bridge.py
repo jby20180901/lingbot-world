@@ -32,8 +32,16 @@ def main():
     intr = np.load(args.intrinsics_file).astype(np.float32)
     if pose.shape != (4, 4):
         raise ValueError(f"pose must be [4,4], got {pose.shape}")
-    if intr.shape != (3, 3):
-        raise ValueError(f"intrinsics must be [3,3], got {intr.shape}")
+    if intr.shape == (4,):
+        fx, fy, cx, cy = intr.tolist()
+        intr_mat = np.array(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+    elif intr.shape == (3, 3):
+        intr_mat = intr
+    else:
+        raise ValueError(f"intrinsics must be [4] or [3,3], got {intr.shape}")
 
     hwm_app = _load_hwm_app(args.hwm_repo)
 
@@ -64,7 +72,7 @@ def main():
 
         device = next(model.parameters()).device
         viewmats = torch.from_numpy(pose).to(device)[None, None]
-        Ks = torch.from_numpy(intr).to(device)[None, None]
+        Ks = torch.from_numpy(intr_mat).to(device)[None, None]
 
         means = splats["means"].to(device)
         quats = splats["quats"].to(device)

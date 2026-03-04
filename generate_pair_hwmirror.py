@@ -76,7 +76,17 @@ def _render_with_hwm(hwm_app, first_frame_pil: Image.Image, pose_b: np.ndarray, 
 
         device = next(model.parameters()).device
         viewmats = torch.from_numpy(pose_b.astype(np.float32)).to(device)[None, None]
-        Ks = torch.from_numpy(intr_b.astype(np.float32)).to(device)[None, None]
+        if intr_b.shape == (4,):
+            fx, fy, cx, cy = intr_b.tolist()
+            intr_mat = np.array(
+                [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+                dtype=np.float32,
+            )
+        elif intr_b.shape == (3, 3):
+            intr_mat = intr_b.astype(np.float32)
+        else:
+            raise ValueError(f"Unsupported intrinsics shape for HWM rendering: {intr_b.shape}")
+        Ks = torch.from_numpy(intr_mat).to(device)[None, None]
 
         means = splats["means"].to(device)
         quats = splats["quats"].to(device)
@@ -168,8 +178,19 @@ def _make_pair_action_dir(poses_pair: np.ndarray, intr_pair: np.ndarray):
         tgt_indices=tgt_indices,
     ).numpy().astype(np.float32)
 
-    if intr_pair.ndim == 2:
+    if intr_pair.ndim == 1 and intr_pair.shape[0] == 4:
         intr_pair = np.stack([intr_pair, intr_pair], axis=0)
+    elif intr_pair.ndim == 3 and intr_pair.shape[-1] == 4:
+        intr_pair = intr_pair.mean(axis=1)
+    elif intr_pair.ndim == 3 and intr_pair.shape[-2:] == (3, 3):
+        fx = intr_pair[:, 0, 0]
+        fy = intr_pair[:, 1, 1]
+        cx = intr_pair[:, 0, 2]
+        cy = intr_pair[:, 1, 2]
+        intr_pair = np.stack([fx, fy, cx, cy], axis=-1)
+
+    if intr_pair.ndim != 2 or intr_pair.shape[1] != 4:
+        raise ValueError(f"Expected pair intrinsics in shape [2,4] after canonicalization, got {intr_pair.shape}")
 
     alpha = tgt_indices[:, None, None]
     intr_interp = (1.0 - alpha) * intr_pair[0:1] + alpha * intr_pair[1:2]
@@ -191,8 +212,34 @@ def generate_pair_hwmirror_video(pipeline, cfg, args):
     poses = np.load(os.path.join(args.action_path, "poses.npy")).astype(np.float32)
     intr = np.load(os.path.join(args.action_path, "intrinsics.npy")).astype(np.float32)
 
-    if intr.ndim == 2:
-        intr = np.repeat(intr[None, ...], repeats=poses.shape[0], axis=0)
+    if intr.ndim == 1 and intr.shape[0] == 4:
+        intr = np.repeat(intr[None, :], repeats=poses.shape[0], axis=0)
+    elif intr.ndim == 2 and intr.shape[-1] == 4:
+        if intr.shape[0] == 1:
+            intr = np.repeat(intr, repeats=poses.shape[0], axis=0)
+        elif intr.shape[0] != poses.shape[0]:
+            intr = intr[:poses.shape[0]]
+    elif intr.ndim == 3 and intr.shape[-1] == 4:
+        intr = intr.mean(axis=1)
+        if intr.shape[0] != poses.shape[0]:
+            intr = intr[:poses.shape[0]]
+    elif intr.ndim == 3 and intr.shape[-2:] == (3, 3):
+        fx = intr[:, 0, 0]
+        fy = intr[:, 1, 1]
+        cx = intr[:, 0, 2]
+        cy = intr[:, 1, 2]
+        intr = np.stack([fx, fy, cx, cy], axis=-1)
+        if intr.shape[0] != poses.shape[0]:
+            intr = intr[:poses.shape[0]]
+    else:
+        raise ValueError(f"Unsupported intrinsics shape: {intr.shape}")
+
+    if intr.shape[0] < poses.shape[0]:
+        pad = poses.shape[0] - intr.shape[0]
+        intr = np.concatenate([intr, np.repeat(intr[-1:], repeats=pad, axis=0)], axis=0)
+
+    if intr.ndim != 2 or intr.shape[1] != 4:
+        raise ValueError(f"Canonical intrinsics must be [N,4], got {intr.shape}")
 
     pair_count = poses.shape[0] // 2
     if pair_count <= 0:
