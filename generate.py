@@ -238,35 +238,20 @@ def _parse_args():
         default=None,
         help="Optional output npz path for per-frame camera matrices. Default: <save_file>.camera_matrices.npz")
     parser.add_argument(
-        "--use_pair_hwmirror",
+        "--enable_worldmirror_pairwise",
         type=str2bool,
         default=False,
-        help="Whether to use pair-wise (2 poses per group) HunyuanWorld-Mirror complementary guidance flow.")
+        help="Enable pairwise generation: first pose normal generation, second pose uses HunyuanWorld-Mirror render injection.")
     parser.add_argument(
-        "--hwm_repo",
+        "--worldmirror_service_url",
         type=str,
-        default="../HunyuanWorld-Mirror",
-        help="Path to HunyuanWorld-Mirror repository for pair-wise guidance flow.")
+        default="http://127.0.0.1:18080",
+        help="HunyuanWorld-Mirror service URL.")
     parser.add_argument(
-        "--hwm_use_subprocess",
-        type=str2bool,
-        default=True,
-        help="Run HunyuanWorld-Mirror rendering via subprocess so Lingbot and HWM can use separate conda envs.")
-    parser.add_argument(
-        "--hwm_conda_env",
-        type=str,
-        default=None,
-        help="Conda env name used when --hwm_use_subprocess is true (example: hunyuanworld-mirror).")
-    parser.add_argument(
-        "--hwm_python",
-        type=str,
-        default=None,
-        help="Optional Python executable path for HWM subprocess. If set, it overrides --hwm_conda_env.")
-    parser.add_argument(
-        "--guidance_fft_radius",
-        type=int,
-        default=10,
-        help="FFT radius used for low/high frequency complementary filtering when --use_pair_hwmirror is enabled.")
+        "--complementary_alpha",
+        type=float,
+        default=0.7,
+        help="Complementary filtering alpha for second-pose diffusion injection.")
     
     args = parser.parse_args()
     _validate_args(args)
@@ -380,11 +365,6 @@ def generate(args):
         img = Image.open(args.image).convert("RGB")
         logging.info(f"Input image: {args.image}")
 
-    if args.use_pair_hwmirror and args.action_path is None:
-        raise ValueError("action_path is required when use_pair_hwmirror is enabled")
-    if args.use_pair_hwmirror and args.hwm_use_subprocess and args.hwm_conda_env is None and args.hwm_python is None:
-        raise ValueError("When use_pair_hwmirror and hwm_use_subprocess are enabled, provide hwm_conda_env or hwm_python")
-
     # prompt extend
     if args.use_prompt_extend:
         logging.info("Extending prompt ...")
@@ -412,12 +392,31 @@ def generate(args):
     )
     logging.info("Generating video ...")
     
-    if args.use_pair_hwmirror:
-        from generate_pair_hwmirror import generate_pair_hwmirror_video
-        video = generate_pair_hwmirror_video(
-            pipeline=wan_i2v,
-            cfg=cfg,
-            args=args,
+    if args.enable_worldmirror_pairwise:
+        if args.action_path is None:
+            raise ValueError("action_path is required when enable_worldmirror_pairwise is true")
+        if args.use_sliding_window:
+            raise ValueError("enable_worldmirror_pairwise is incompatible with use_sliding_window")
+
+        from wan.pairwise_worldmirror import generate_pairwise_with_worldmirror
+        video = generate_pairwise_with_worldmirror(
+            wan_i2v=wan_i2v,
+            input_prompt=args.prompt,
+            init_image=img,
+            action_path=args.action_path,
+            frame_num=args.frame_num,
+            max_area=MAX_AREA_CONFIGS[args.size],
+            shift=args.sample_shift,
+            sample_solver=args.sample_solver,
+            sampling_steps=args.sample_steps,
+            guide_scale=args.sample_guide_scale,
+            seed=args.base_seed,
+            offload_model=args.offload_model,
+            save_intermediate_dir=args.save_intermediate_dir,
+            save_latents=args.save_latents,
+            save_decoded=args.save_decoded,
+            service_url=args.worldmirror_service_url,
+            complementary_alpha=args.complementary_alpha,
         )
     elif args.use_sliding_window:
         # Use sliding window for long video generation

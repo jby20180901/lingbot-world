@@ -13,6 +13,7 @@ import torch
 import torch.cuda.amp as amp
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
+from PIL import Image
 from tqdm import tqdm
 
 from .distributed.fsdp import shard_model
@@ -35,45 +36,6 @@ from .utils.cam_utils import (
     get_Ks_transformed,
 )
 from einops import rearrange
-
-
-def _guidance_lambda(step_idx, early_step_end, mid_step_end, lambda_early, lambda_mid):
-    if step_idx < early_step_end:
-        return float(lambda_early)
-    if step_idx < mid_step_end:
-        span = max(1, mid_step_end - early_step_end)
-        ratio = float(step_idx - early_step_end) / float(span)
-        return float(lambda_early + ratio * (lambda_mid - lambda_early))
-    return 0.0
-
-
-def _match_mean_std(source, target, eps=1e-6):
-    source_mean = source.mean(dim=(-3, -2, -1), keepdim=True)
-    source_std = source.std(dim=(-3, -2, -1), keepdim=True).clamp_min(eps)
-    target_mean = target.mean(dim=(-3, -2, -1), keepdim=True)
-    target_std = target.std(dim=(-3, -2, -1), keepdim=True).clamp_min(eps)
-    return (source - source_mean) / source_std * target_std + target_mean
-
-
-def _fft_low_high_mix(ref_low_source, curr_high_source, radius):
-    _, _, h, w = ref_low_source.shape
-    crow = h // 2
-    ccol = w // 2
-    safe_radius = int(max(1, min(radius, min(crow, ccol) - 1)))
-
-    yy, xx = torch.meshgrid(
-        torch.arange(h, device=ref_low_source.device),
-        torch.arange(w, device=ref_low_source.device),
-        indexing='ij',
-    )
-    mask_2d = ((yy - crow) ** 2 + (xx - ccol) ** 2 <= safe_radius * safe_radius).to(ref_low_source.dtype)
-    mask = mask_2d.view(1, 1, h, w)
-
-    ref_fft = torch.fft.fftshift(torch.fft.fft2(ref_low_source, dim=(-2, -1)), dim=(-2, -1))
-    curr_fft = torch.fft.fftshift(torch.fft.fft2(curr_high_source, dim=(-2, -1)), dim=(-2, -1))
-    mixed_fft = ref_fft * mask + curr_fft * (1.0 - mask)
-    mixed = torch.fft.ifft2(torch.fft.ifftshift(mixed_fft, dim=(-2, -1)), dim=(-2, -1)).real
-    return mixed
 
 
 class WanI2V:
@@ -265,12 +227,8 @@ class WanI2V:
                  save_intermediate_dir=None,
                  save_latents=True,
                  save_decoded=False,
-                 guidance_frame_tensors=None,
-                 guidance_fft_radius=10,
-                 guidance_early_step_end=15,
-                 guidance_mid_step_end=30,
-                 guidance_lambda_early=0.7,
-                 guidance_lambda_mid=0.2):
+                 injection_image=None,
+                 complementary_alpha=0.7):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -431,43 +389,32 @@ class WanI2V:
         ])[0]
         y = torch.concat([msk, y])
 
+        injection_latent = None
+        if injection_image is not None:
+            if isinstance(injection_image, Image.Image):
+                injection_tensor = TF.to_tensor(injection_image).sub_(0.5).div_(0.5)
+            elif isinstance(injection_image, torch.Tensor):
+                injection_tensor = injection_image.detach().float()
+                if injection_tensor.ndim == 4 and injection_tensor.shape[1] == 1:
+                    injection_tensor = injection_tensor[:, 0]
+                if injection_tensor.ndim != 3:
+                    raise ValueError(f"Expected injection tensor shape [3,H,W], got {tuple(injection_tensor.shape)}")
+            else:
+                raise ValueError("injection_image must be PIL.Image or torch.Tensor")
+
+            injection_tensor = injection_tensor.to(self.device)
+            injection_tensor = torch.nn.functional.interpolate(
+                injection_tensor.unsqueeze(0),
+                size=(h, w),
+                mode='bicubic',
+                align_corners=False,
+            ).squeeze(0)
+            injection_video = injection_tensor.unsqueeze(1).repeat(1, F, 1, 1)
+            injection_latent = self.vae.encode([injection_video])[0]
+
         @contextmanager
         def noop_no_sync():
             yield
-
-        guidance_latents_by_latidx = {}
-        if guidance_frame_tensors is not None and len(guidance_frame_tensors) > 0:
-            for frame_idx, frame_tensor in guidance_frame_tensors.items():
-                if frame_tensor is None:
-                    continue
-                if not isinstance(frame_tensor, torch.Tensor):
-                    frame_tensor = torch.tensor(frame_tensor)
-                frame_tensor = frame_tensor.float()
-                if frame_tensor.ndim != 3:
-                    continue
-                if frame_tensor.shape[0] != 3 and frame_tensor.shape[-1] == 3:
-                    frame_tensor = frame_tensor.permute(2, 0, 1)
-                if frame_tensor.shape[0] != 3:
-                    continue
-
-                frame_tensor = frame_tensor.to(self.device)
-                if frame_tensor.max().item() > 1.5:
-                    frame_tensor = frame_tensor / 255.0
-                frame_tensor = frame_tensor.clamp(0.0, 1.0)
-                frame_tensor = frame_tensor.mul(2.0).sub(1.0)
-                frame_tensor = torch.nn.functional.interpolate(
-                    frame_tensor.unsqueeze(0), size=(h, w), mode='bicubic', align_corners=False
-                ).squeeze(0)
-
-                ref_video = frame_tensor.unsqueeze(1)
-                ref_lat = self.vae.encode([ref_video])[0].to(self.device)
-                lat_idx = min(lat_f - 1, max(0, int(frame_idx) // self.vae_stride[0]))
-                if lat_idx in guidance_latents_by_latidx:
-                    guidance_latents_by_latidx[lat_idx] = 0.5 * (
-                        guidance_latents_by_latidx[lat_idx] + ref_lat
-                    )
-                else:
-                    guidance_latents_by_latidx[lat_idx] = ref_lat
 
         no_sync_low_noise = getattr(self.low_noise_model, 'no_sync',
                                     noop_no_sync)
@@ -563,24 +510,13 @@ class WanI2V:
                     generator=seed_g)[0]
                 latent = temp_x0.squeeze(0)
 
-                if guidance_latents_by_latidx:
-                    step_lambda = _guidance_lambda(
-                        step_idx,
-                        guidance_early_step_end,
-                        guidance_mid_step_end,
-                        guidance_lambda_early,
-                        guidance_lambda_mid,
-                    )
-                    if step_lambda > 0:
-                        t_norm = float(np.clip(float(t.item()) / float(self.num_train_timesteps), 0.0, 1.0))
-                        for lat_idx, ref_lat in guidance_latents_by_latidx.items():
-                            curr_slice = latent[:, lat_idx:lat_idx + 1, :, :]
-                            ref_slice = ref_lat[:, :1, :, :].to(curr_slice.device, curr_slice.dtype)
-                            eps = torch.randn_like(curr_slice)
-                            ref_noisy = (1.0 - t_norm) * ref_slice + t_norm * eps
-                            ref_aligned = _match_mean_std(ref_noisy, curr_slice)
-                            mixed = _fft_low_high_mix(ref_aligned, curr_slice, guidance_fft_radius)
-                            latent[:, lat_idx:lat_idx + 1, :, :] = (1.0 - step_lambda) * curr_slice + step_lambda * mixed
+                if injection_latent is not None:
+                    sigma = float(t.item()) / float(self.num_train_timesteps)
+                    sigma = float(np.clip(sigma, 0.0, 1.0))
+                    noise_ref = torch.randn_like(injection_latent)
+                    injection_noisy = (1.0 - sigma) * injection_latent + sigma * noise_ref
+                    alpha = float(np.clip(complementary_alpha, 0.0, 1.0))
+                    latent = alpha * latent + (1.0 - alpha) * injection_noisy
 
                 if result_saver is not None:
                     result_saver.save_step_results(
