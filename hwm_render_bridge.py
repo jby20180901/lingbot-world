@@ -128,17 +128,29 @@ def main():
     parser = argparse.ArgumentParser(description="Render one pose image from HunyuanWorld-Mirror 3DGS via app.py")
     parser.add_argument("--server", action="store_true", help="Run persistent JSON-line request server mode.")
     parser.add_argument("--hwm_repo", type=str, required=True)
-    parser.add_argument("--input_image", type=str, required=True)
-    parser.add_argument("--pose_file", type=str, required=True)
-    parser.add_argument("--intrinsics_file", type=str, required=True)
-    parser.add_argument("--target_h", type=int, required=True)
-    parser.add_argument("--target_w", type=int, required=True)
-    parser.add_argument("--output_png", type=str, required=True)
+    parser.add_argument("--input_image", type=str, default=None)
+    parser.add_argument("--pose_file", type=str, default=None)
+    parser.add_argument("--intrinsics_file", type=str, default=None)
+    parser.add_argument("--target_h", type=int, default=None)
+    parser.add_argument("--target_w", type=int, default=None)
+    parser.add_argument("--output_png", type=str, default=None)
     args = parser.parse_args()
 
     if args.server:
         _run_server(args.hwm_repo)
         return
+
+    required_fields = {
+        "input_image": args.input_image,
+        "pose_file": args.pose_file,
+        "intrinsics_file": args.intrinsics_file,
+        "target_h": args.target_h,
+        "target_w": args.target_w,
+        "output_png": args.output_png,
+    }
+    missing = [name for name, value in required_fields.items() if value is None]
+    if missing:
+        raise ValueError(f"Missing required arguments in non-server mode: {', '.join(missing)}")
 
     pose = np.load(args.pose_file).astype(np.float32)
     intr = np.load(args.intrinsics_file).astype(np.float32)
